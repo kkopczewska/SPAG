@@ -1,0 +1,223 @@
+### R code for SPAG spatial agglomeration measure
+
+# necessary packages
+library(spdep)
+library(rgdal)
+library(maptools)
+library(sp)
+library(rgeos)
+
+# reading shapefiles
+woj<-readOGR(".","wojewodztwa") # 16 NTS2 units
+pow<-readOGR(".","powiaty") # 380 NTS4 units
+projekcja<- "+proj=longlat +datum=WGS84"
+woj <- spTransform(woj, CRS(projekcja))
+pow <- spTransform(pow, CRS(projekcja))
+
+# selecting one NTS2 region from bigger map
+woj.df<-as.data.frame(woj)
+region<-woj[woj.df$jpt_nazwa_== "lubelskie",]
+region<-spTransform(region, CRS(projekcja))
+
+dane<-read.csv("firms.csv", header=TRUE, sep=";", dec= ".")
+summary(dane)
+
+######################
+# preparing the subset for calculating SPAG
+my_sector<-"L" # choose the analysed sector
+dane.sel<-dane[dane$SECTOR_PKD7==my_sector, c(16,17,14,12)]
+colnames(dane.sel)<-c("coords.x","coords.y","firm_size","section")
+k<-nrow(dane.sel)# checking how many observations were selected
+area.region<-gArea(region) #denominator of nomin.coverage.sel
+
+# radii optimisation for all firms in dataset
+a<-table(dane.sel$firm_size)
+a1<-cbind(as.data.frame(rownames(a)), y=as.vector(a))
+a2<-data.frame(x=c(1,2,3,4,5))
+a3<-merge(a2, a1, by.x="x", by.y="rownames(a)", all.x=TRUE)
+a3[is.na(a3$y)==TRUE,]<-0
+ile.firm<-a3 # table with number of obs. for all categories
+
+# functions for circles proportional to employment
+fa<-function(r) ile.firm[1,2]*pi*1*r^2
+fb<-function(r) ile.firm[2,2]*pi*6*r^2
+fc<-function(r) ile.firm[3,2]*pi*30*r^2
+fd<-function(r) ile.firm[4,2]*pi*120*r^2
+fe<-function(r) ile.firm[5,2]*pi*300*r^2
+wynik<-uniroot(function(r) fa(r)+fb(r)+fc(r)+fd(r)+fe(r)- area.region, c(0, 100000), tol = 1e-35)
+myroot<-wynik$root
+dane.sel$multiplier.of.r<-ifelse(dane.sel$firm_size==1, 1, ifelse(dane.sel$firm_size == 2, sqrt(6), ifelse(dane.sel$firm_size == 3, sqrt(30), ifelse(dane.sel$firm_size == 4, sqrt(120), sqrt(300)))))
+
+# employment and radius variable
+dane.sel$r<-(dane.sel$multiplier.of.r)*myroot #getting radius r
+dane.sel$area<-pi*dane.sel$r^2 #area of circle added to dataset
+sum(dane.sel$area)- area.region # if it gives 0, than OK
+area.sel.empir<-sum(dane.sel$area) # counter.coverage.wybr
+
+# distances between firms
+# give numbers of columns in which x and y are located
+xy<-cbind(dane.sel[,1], dane.sel[,2])
+xy.sp<- SpatialPoints(xy) # required for do gBuffer
+circles.sel<-gBuffer(xy.sp, quadsegs=50, byid=TRUE, width=dane.sel$r)
+
+# random matrix of distances
+ile<-min(k,3000)
+losy<-sample(1:k, ile, replace = FALSE)
+length(losy)
+xy.losy<-xy[losy,]
+odle<-dist(xy.losy)
+mean.dist.sel.empir<-mean(odle)
+
+# union of overlapping circles (no borders when overlapping)
+pol.sel<-gUnaryUnion(circles.sel) # from rgeos package
+area.circles.sel<-pol.sel@polygons[[1]]@area
+area.circles.sel # counter.overlap.selected
+area.region # to compare with area of region
+
+# counter for given sector
+counter.coverage.sel<-area.sel.empir
+counter.distance.sel<-mean.dist.sel.empir
+counter.overlap.sel<-area.circles.sel
+
+# theoretical part – denominator
+n<-dim(dane)[1]
+
+# equal location of selected points
+loc.teoret.sel<- spsample(region, k, type="regular") # might be "random"
+k1<-length(loc.teoret.sel)
+r.teoret<-sqrt(area.region/(k1*pi))
+
+# distances for selected theoretical locations – random selection
+ile2<-min(100, k1)
+losy2<-sample(1:k1, ile2, replace = FALSE)
+odle.teoret.sel<-dist(as.matrix(loc.teoret.sel@coords[losy2,]))
+mean.dist.sel.theoret<-mean(odle.teoret.sel)
+
+# denominator for selected industries
+nomin.coverage.sel<- area.region
+nomin.distance.sel<- mean.dist.sel.theoret
+nomin.overlap.sel<-k1*pi*r.teoret^2 #in fact area of region
+
+#SPAG
+i.coverage.sel<-counter.coverage.sel/nomin.coverage.sel
+i.distance.sel<-counter.distance.sel/nomin.distance.sel
+i.overlap.sel<-counter.overlap.sel/nomin.overlap.sel
+SPAG.sel<- i.coverage.sel * i.distance.sel * i.overlap.sel
+SPAG.sel.result<-data.frame(i.coverage.sel, i.distance.sel, i.overlap.sel, SPAG.sel)
+round(SPAG.sel.result,2)
+ramka<-as.matrix(region@bbox)
+plot(circles.sel, xlim=c(ramka[1,1], ramka[1,2]), ylim=c(ramka[2,1], ramka[2,2]))
+plot(region, add=TRUE)
+
+# specify coordinates in the legend
+legend("bottomleft", legend=c(paste("i.coverage=",round(i.coverage.sel,2)),  paste("i.distance=",round(i.distance.sel,2)), paste("i.overlap=",round(i.overlap.sel,2)), paste("SPAG=",round(SPAG.sel,4)), paste("n obs.=",round(k,2))), cex=0.7, bty="n")
+title(main=paste("SPAG for sector ", my_sector))
+
+########################################################
+
+# permutation test to define confidence interval
+replics<-200 # number of replications
+SPAGslots<-matrix(0, nrow=replics, ncol=4)
+colnames(SPAGslots)<-c("Icov","Idist","Ioverlap","SPAG")
+
+for(i in 1:20){
+# selection of sectors for analysis 
+dane.sel<-dane[dane$SECTOR_PKD7=="L", c(16,17,14,12)]
+colnames(dane.sel)<-c("coords.x","coords.y","firm_size","section")
+k<-nrow(dane.sel)# checking how many observations were selected
+head(dane.sel)
+
+locs<-spsample(region, k, type="random")
+dane.sel<-cbind(as.data.frame(locs), sample(dane.sel$firm_size, k, replace=FALSE))
+colnames(dane.sel)<-c("coords.x","coords.y","firm_size")
+head(dane.sel)
+
+area.region<-gArea(region) #denominator of nomin.coverage.sel
+
+# radii optimisation for all firms in dataset
+a<-table(dane.sel$firm_size)
+a1<-cbind(as.data.frame(rownames(a)), y=as.vector(a))
+a2<-data.frame(x=c(1,2,3,4,5))
+a3<-merge(a2, a1, by.x="x", by.y="rownames(a)", all.x=TRUE)
+a3[is.na(a3$y)==TRUE,]<-0
+ile.firm<-a3 # table with number of obs. for all categories
+
+# functions for circles proportional to employment
+fa<-function(r) ile.firm[1,2]*pi*1*r^2
+fb<-function(r) ile.firm[2,2]*pi*6*r^2
+fc<-function(r) ile.firm[3,2]*pi*30*r^2
+fd<-function(r) ile.firm[4,2]*pi*120*r^2
+fe<-function(r) ile.firm[5,2]*pi*300*r^2
+wynik<-uniroot(function(r) fa(r)+fb(r)+fc(r)+fd(r)+fe(r)- area.region, c(0, 100000), tol = 1e-35)
+myroot<-wynik$root
+dane.sel$multiplier.of.r<-ifelse(dane.sel$firm_size==1, 1, ifelse(dane.sel$firm_size == 2, sqrt(6), ifelse(dane.sel$firm_size == 3, sqrt(30), ifelse(dane.sel$firm_size == 4, sqrt(120), sqrt(300)))))
+
+# employment and radius variable
+dane.sel$r<-(dane.sel$multiplier.of.r)*myroot #getting radius r
+dane.sel$area<-pi*dane.sel$r^2 #area of circle added to dataset
+sum(dane.sel$area)- area.region # if it gives 0, than OK
+area.sel.empir<-sum(dane.sel$area) # counter.coverage.wybr
+
+# distances between firms
+# give numbers of columns in which x and y are located
+xy<-cbind(dane.sel[,1], dane.sel[,2])
+xy.sp<- SpatialPoints(xy) # required for do gBuffer
+circles.sel<-gBuffer(xy.sp, quadsegs=50, byid=TRUE, width=dane.sel$r)
+
+# random matrix of distances
+ile<-min(k,3000)
+losy<-sample(1:k, ile, replace = FALSE)
+length(losy)
+xy.losy<-xy[losy,]
+odle<-dist(xy.losy)
+mean.dist.sel.empir<-mean(odle)
+
+# union of overlapping circles (no borders when overlapping)
+pol.sel<-gUnaryUnion(circles.sel) # from rgeos package
+area.circles.sel<-pol.sel@polygons[[1]]@area
+area.circles.sel # counter.overlap.selected
+area.region # to compare with area of region
+
+# counter for given sector
+counter.coverage.sel<-area.sel.empir
+counter.distance.sel<-mean.dist.sel.empir
+counter.overlap.sel<-area.circles.sel
+
+# theoretical part – denominator
+n<-dim(dane)[1]
+
+# equal location of selected points
+loc.teoret.sel<- spsample(region, k, type="regular") # might be "random"
+k1<-length(loc.teoret.sel)
+r.teoret<-sqrt(area.region/(k1*pi))
+
+# distances for selected theoretical locations – random selection
+ile2<-min(100, k1)
+losy2<-sample(1:k1, ile2, replace = FALSE)
+odle.teoret.sel<-dist(as.matrix(loc.teoret.sel@coords[losy2,]))
+mean.dist.sel.theoret<-mean(odle.teoret.sel)
+
+# denominator for selected industries
+nomin.coverage.sel<- area.region
+nomin.distance.sel<- mean.dist.sel.theoret
+nomin.overlap.sel<-k1*pi*r.teoret^2 #in fact area of region
+
+#SPAG
+i.coverage.sel<-counter.coverage.sel/nomin.coverage.sel
+i.distance.sel<-counter.distance.sel/nomin.distance.sel
+i.overlap.sel<-counter.overlap.sel/nomin.overlap.sel
+SPAG.sel<- i.coverage.sel * i.distance.sel * i.overlap.sel
+SPAG.sel.result<-data.frame(i.coverage.sel, i.distance.sel, i.overlap.sel, SPAG.sel)
+round(SPAG.sel.result,6)
+SPAGslots[i,1]<-i.coverage.sel
+SPAGslots[i,2]<-i.distance.sel
+SPAGslots[i,3]<-i.overlap.sel
+SPAGslots[i,4]<-SPAG.sel
+}
+SPAGslots
+
+# plot the confidence interval and compare with empirical SPAG value
+plot(density(SPAGslots[,4]), xlim=c(0,1), main=paste("Confidence interval for SPAG - sector ", my_sector))
+legend("topleft", c("CI", "empirical SPAG"), col=c("black","red"), cex=0.8, bty="n", lty=c(1,2))
+abline(v=SPAG.sel, col="red", lwd=2, lty=2) # give the empirical SPAG value
+
